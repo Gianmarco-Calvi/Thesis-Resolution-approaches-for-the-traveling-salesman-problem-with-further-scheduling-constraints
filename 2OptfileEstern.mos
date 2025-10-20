@@ -1,0 +1,334 @@
+model TSJP_2opt
+uses "mmxprs"
+uses "mmsystem"
+
+parameters
+  datafile = "istanza.dat"
+end-parameters
+
+declarations
+  n: integer;  ! Number of jobs/nodes
+  M: real
+end-declarations
+
+! First read only n from file
+initializations from datafile
+  n
+end-initializations
+
+declarations
+  ! FIRST MODEL - TSP
+  Y: array(0..n,0..n) of mpvar;     ! Auxiliary variable for sequence
+  X: array(0..n,0..n) of mpvar;     ! If I go from node i to node j
+  t: array(0..n,0..n) of real;      ! Travel time
+  risultato_tsp: real;
+  
+  ! SECOND MODEL - Job Assignment
+  Cmax: mpvar;
+  Z: array(1..n,1..n) of mpvar;     ! If in position k I assign job i
+  T: array(1..n) of real;           ! Job start time (calculated from first model)
+  p: array(0..n, 0..n) of real;     ! Processing time at node i for job j
+  
+  ! FINAL SECOND MODEL - Job Assignment for final solution
+  Cmax_final: mpvar;
+  Z_final: array(1..n,1..n) of mpvar;
+  
+  ! VARIABLES FOR 2-OPT
+  tour: array(0..n) of integer;     ! Current tour
+  best_tour: array(0..n) of integer;! Best tour found
+  T_2opt: array(1..n) of real;      ! Arrival times for 2-opt tour
+  best_T: array(1..n) of real;      ! Arrival times of best tour
+  current_cmax: real;               ! Current Cmax
+  best_cmax: real;                  ! Best Cmax found
+  improvement: boolean;             ! Flag for improvements
+  iter_2opt: integer;               ! 2-opt iteration counter
+  costo_tour_finale: real;          ! Final tour cost
+  
+  ! Auxiliary variables
+  somma: real;
+  current_node: integer;
+  start_time, end_time: real;
+  temp_node: integer;
+  min_processing_time: real;
+  temp_cmax: real;
+end-declarations
+
+! Now read matrices with correct dimensions
+initializations from datafile
+  t
+  p
+end-initializations
+
+writeln("=== COMBINED TSJP MODEL WITH 2-OPT ===")
+writeln("Phase 1: TSP resolution for initial solution")
+writeln("Phase 2: Job assignment for initial solution")
+writeln("Phase 3: Improvement with 2-opt heuristic")
+writeln
+
+start_time := gettime
+M := 1000.0;
+
+! ==============================================
+! PHASE 1: OPTIMAL TSP
+! ==============================================
+
+writeln("--- PHASE 1: OPTIMAL TSP RESOLUTION ---")
+
+! TSP constraints
+forall(i in 0..n) do
+  sum(j in 0..n | j <> i)(X(i,j)) = 1;
+end-do
+
+forall(j in 0..n) do
+  sum(i in 0..n | i <> j)(X(i,j)) = 1;
+end-do
+
+forall(i in 1..n) do
+  sum(j in 0..n | i <> j)Y(i,j)-sum(j in 0..n | i <> j)Y(j,i) = 1;
+end-do
+
+forall(i in 1..n, j in 0..n | i <> j) do
+  Y(i,j) <= n * X(i,j);
+end-do
+
+forall(i in 0..n, j in 0..n) do
+  X(i,j) is_binary;
+  Y(i,j) >= 0;
+end-do
+
+! TSP objective function
+minimize(sum(i in 0..n, j in 0..n)t(i,j) * X(i,j))
+
+writeln("TSP solved. Optimal tour cost: ", getobjval)
+risultato_tsp := getobjval;
+
+! Extract optimal tour
+current_node := 0;
+tour(0) := 0;
+forall(step in 1..n) do
+  forall(j in 0..n) do
+    if getsol(X(current_node, j)) = 1 then
+      tour(step) := j;
+      current_node := j;
+      break;
+    end-if
+  end-do
+end-do
+
+write("Optimal TSP tour: ");
+forall(i in 0..n) write(tour(i), " ");
+writeln
+
+! ==============================================
+! PHASE 2: INITIAL ASSIGNMENT
+! ==============================================
+
+writeln("--- PHASE 2: INITIAL JOB ASSIGNMENT ---")
+
+! Calculate arrival times for optimal TSP solution
+somma := 0;
+forall(step in 1..n) do
+  somma := somma + t(tour(step-1), tour(step));
+  T(tour(step)) := somma;
+end-do
+
+writeln("Arrival times from optimal TSP solution:")
+forall(j in 1..n) do
+  writeln("T(", j, ") = ", T(j));
+end-do
+
+! Solve assignment problem
+Cmax >= risultato_tsp;
+
+forall(k in 1..n) do
+  sum(i in 1..n)(Z(i,k)) = 1;
+end-do
+
+forall(i in 1..n) do
+  sum(k in 1..n)(Z(i,k)) = 1;
+end-do
+
+forall(i in 1..n) do
+  Cmax >= T(i) + sum(k in 1..n)(Z(i,k)*p(i,k));
+end-do
+
+forall(i in 1..n, k in 1..n) do
+  Z(i,k) is_binary;
+end-do
+
+minimize(Cmax);
+
+current_cmax := getsol(Cmax);
+best_cmax := current_cmax;
+writeln("Initial solution Cmax: ", current_cmax);
+
+! Save initial Cmax for final summary
+declarations
+  initial_cmax: real;
+end-declarations
+initial_cmax := current_cmax;
+
+! Save initial solution as best
+forall(i in 0..n) do
+  best_tour(i) := tour(i);
+end-do
+forall(i in 1..n) do
+  best_T(i) := T(i);
+end-do
+
+! ==============================================
+! PHASE 3: IMPROVEMENT WITH 2-OPT
+! ==============================================
+
+writeln
+writeln("--- PHASE 3: IMPROVEMENT WITH 2-OPT ---")
+
+iter_2opt := 0;
+improvement := true;
+
+while (improvement) do
+  improvement := false;
+  iter_2opt := iter_2opt + 1;
+  
+  writeln("2-opt iteration #", iter_2opt);
+  
+  ! Try all possible 2-opt moves
+  forall(i in 1..n-2) do
+    forall(k in i+1..n-1) do
+      ! Generate new tour with 2-opt swap manually
+      forall(c in 0..i-1) do
+        tour(c) := best_tour(c);
+      end-do
+      
+      ! Reverse segment from i to k
+      forall(c in i..k) do
+        tour(c) := best_tour(k-(c-i));
+      end-do
+      
+      ! Copy final part
+      forall(c in k+1..n) do
+        tour(c) := best_tour(c);
+      end-do
+      
+      ! Calculate new arrival times
+      somma := 0;
+      forall(step in 1..n) do
+        somma := somma + t(tour(step-1), tour(step));
+        T_2opt(tour(step)) := somma;
+      end-do
+      
+      ! Calculate new Cmax using heuristic estimate
+      current_cmax := 0;
+      forall(node in 1..n) do
+        ! For each node, find minimum processing time
+        min_processing_time := M;
+        forall(job in 1..n) do
+          if p(node,job) < min_processing_time then
+            min_processing_time := p(node,job);
+          end-if
+        end-do
+        temp_cmax := T_2opt(node) + min_processing_time;
+        if temp_cmax > current_cmax then
+          current_cmax := temp_cmax;
+        end-if
+      end-do
+      
+      ! If solution is better, update
+      if current_cmax < best_cmax then
+        writeln("  Improvement found! Swap(", i, ",", k, "): ", best_cmax, " -> ", current_cmax);
+        best_cmax := current_cmax;
+        forall(idx in 0..n) do
+          best_tour(idx) := tour(idx);
+        end-do
+        forall(idx in 1..n) do
+          best_T(idx) := T_2opt(idx);
+        end-do
+        improvement := true;
+      end-if
+    end-do
+  end-do
+  
+  if not improvement then
+    writeln("  No improvement found in this iteration");
+  end-if
+end-do
+
+! ==============================================
+! FINAL RESOLUTION WITH OPTIMAL ASSIGNMENT
+! ==============================================
+
+writeln
+writeln("--- FINAL RESOLUTION WITH OPTIMAL ASSIGNMENT ---")
+
+! Use times from best tour found with 2-opt
+forall(i in 1..n) do
+  T(i) := best_T(i);
+end-do
+
+! Define new assignment model
+forall(k in 1..n) do
+  sum(i in 1..n)(Z_final(i,k)) = 1;
+end-do
+
+forall(i in 1..n) do
+  sum(k in 1..n)(Z_final(i,k)) = 1;
+end-do
+
+forall(i in 1..n) do
+  Cmax_final >= T(i) + sum(k in 1..n)(Z_final(i,k)*p(i,k));
+end-do
+
+forall(i in 1..n, k in 1..n) do
+  Z_final(i,k) is_binary;
+end-do
+
+! Solve final problem
+minimize(Cmax_final);
+
+end_time := gettime;
+
+! ==============================================
+! FINAL RESULTS
+! ==============================================
+
+writeln
+writeln("=== FINAL RESULTS ===")
+writeln("Total execution time: ", end_time - start_time, " seconds")
+writeln("2-opt iterations executed: ", iter_2opt-1)
+writeln
+
+! Calculate final tour cost
+costo_tour_finale := 0;
+forall(i in 0..n-1) do
+  costo_tour_finale := costo_tour_finale + t(best_tour(i), best_tour(i+1));
+end-do
+costo_tour_finale := costo_tour_finale + t(best_tour(n), best_tour(0));
+
+writeln("SOLUTION COMPARISON:")
+writeln("Initial solution (optimal TSP):")
+writeln("  TSP tour cost: ", risultato_tsp)
+writeln("  Initial Cmax: ", initial_cmax)
+writeln
+writeln("Final solution (after 2-opt):")
+writeln("  TSP tour cost: ", costo_tour_finale)
+writeln("  Final Cmax: ", getsol(Cmax_final))
+writeln
+
+write("Final tour: ");
+forall(i in 0..n) write(best_tour(i), " ");
+writeln
+
+writeln("Final arrival times:")
+forall(j in 1..n) do
+  writeln("T(", j, ") = ", best_T(j));
+end-do
+
+writeln
+writeln("Final optimal job assignment:")
+forall(i in 1..n, j in 1..n) do
+  if getsol(Z_final(i,j)) = 1 then
+    writeln("Node ", i, " (T=", best_T(i), ") -> Job ", j, " (proc. time=", p(i,j), ", end=", best_T(i)+p(i,j), ")");
+  end-if
+end-do
+
+end-model
